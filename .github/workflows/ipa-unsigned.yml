@@ -1,0 +1,99 @@
+name: Build unsigned IPA
+
+# Produces an unsigned .ipa for sideloading. Nothing Apple-related is needed:
+# the IPA is re-signed on the way onto the device by Sideloadly / AltStore /
+# ESign with the user's own certificate. Upstream's release-ios.yml is not a
+# substitute - it only ever emits a signed App Store build for TestFlight.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag, branch or SHA to build (default: main)"
+        type: string
+        required: false
+        default: main
+
+concurrency:
+  group: ipa-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      EXPO_NO_TELEMETRY: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ~/.cocoapods/repos
+          key: pods-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: pods-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      # ios/ is gitignored upstream - the native project is generated, never
+      # committed, so it has to be regenerated before anything can be built.
+      - name: Generate the iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Resolve workspace and scheme
+        id: xcode
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Archive without signing
+        run: |
+          xcodebuild archive \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Bulwark.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      # -exportArchive cannot be used here: every export method demands a real
+      # signing identity. An IPA is just a zip with the .app under Payload/,
+      # so the archive's product is repackaged by hand instead.
+      - name: Package the IPA
+        id: package
+        run: |
+          APP=$(ls -d "$RUNNER_TEMP"/Bulwark.xcarchive/Products/Applications/*.app | head -1)
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          NAME="bulwark-mobile-${VERSION}-${GITHUB_SHA::7}-unsigned.ipa"
+          (cd "$RUNNER_TEMP" && zip -qry "$NAME" Payload)
+          mv "$RUNNER_TEMP/$NAME" .
+
+          echo "path=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.path }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
